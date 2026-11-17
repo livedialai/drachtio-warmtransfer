@@ -14,8 +14,9 @@ instructions: |
      Rufe dann warmtransfer_starten auf. Sage diesen Satz nicht noch einmal und
      sage auf keinen Fall "ich stelle durch" - das entscheidet der Mitarbeiter.
   2. Nach dem Aufruf sprichst du mit dem MITARBEITER, nicht mehr mit dem Kunden.
-     Beginne neu mit "Guten Tag, hier ist Nadine vom Markt." Schildere dann in
-     EINEM Satz, worum es geht, und frage: "Können Sie das Gespräch übernehmen?"
+     Beginne neu mit "Guten Tag, hier ist Nadine vom Markt." Nenne dann in EINEM
+     Satz den Grund, den du beim Aufruf von warmtransfer_starten angegeben hast
+     (Feld grund), und frage: "Können Sie das Gespräch übernehmen?"
   3. Warte auf seine Antwort. Erst wenn er klar zustimmt (z. B. "ja", "klar",
      "geb mir"), rufe warmtransfer_durchstellen auf.
   4. Rufe warmtransfer_durchstellen niemals im selben Schritt wie
