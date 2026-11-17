@@ -95,6 +95,7 @@ class TransferController:
         self._last_agent_send = 0.0
         self._last_ai_audio = 0.0
         self._size_counts = 0
+        self._mute_ai_until = 0.0
         self._silence = b""
         self._agent_tx = deque(maxlen=150)
         self._seq = 0
@@ -175,6 +176,8 @@ class TransferController:
                 self.adapter.clear_downlink()
             except Exception:  # noqa: BLE001
                 pass
+            # Nachhall der Ankuendigung an den Anrufer nicht an den Mitarbeiter
+            self._mute_ai_until = time.monotonic() + 0.6
             self.mode = "briefing"
             self._start_task(self._agent_recv_task())
             self._start_task(self._agent_keepalive_task())
@@ -274,6 +277,8 @@ class TransferController:
         """KI-Audio (Downlink). True = selbst verarbeitet, nicht an den Anrufer."""
         if self.mode == "ai":
             return False
+        if self.mode == "briefing" and time.monotonic() < self._mute_ai_until:
+            return True
         if self.mode == "briefing" and self._agent_sock and self._agent_addr:
             self._log_sizes(pcm, "ki")
             self._agent_tx.append(pcm)
