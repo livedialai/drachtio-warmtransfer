@@ -93,6 +93,7 @@ class TransferController:
 
         self._agent_pt = 8          # aus dem SDP der Agent-Leg-Antwort
         self._last_agent_send = 0.0
+        self._last_ai_audio = 0.0
         self._silence = b""
         self._agent_tx = deque(maxlen=50)
         self._seq = 0
@@ -173,6 +174,13 @@ class TransferController:
             rest = grace_until - time.monotonic()
             if rest > 0:
                 await asyncio.sleep(rest)
+
+            # Zusaetzlich warten, bis die KI wirklich still ist (Ankuendigung zu Ende)
+            quiet_deadline = time.monotonic() + 8.0
+            while time.monotonic() < quiet_deadline:
+                if time.monotonic() - self._last_ai_audio >= 0.6:
+                    break
+                await asyncio.sleep(0.1)
 
             self.mode = "moh"
             self._start_task(self._moh_task())
@@ -259,6 +267,10 @@ class TransferController:
             self._agent_sock.sendto(self._rtp_packet(payload), self._agent_addr)
         except OSError:
             return
+
+    def note_ai_audio(self) -> None:
+        """Merkt sich, wann die KI zuletzt Audio geliefert hat."""
+        self._last_ai_audio = time.monotonic()
 
     def on_caller_pcm(self, pcm: bytes) -> None:
         """Audio des Anrufers (Uplink) waehrend eines Transfers."""
