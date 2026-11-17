@@ -20,7 +20,10 @@ Stand: **17.11.2026** — läuft auf einem PPH Essential 2 (2 vCPU, 2 GB), Debia
   der `TransferController` schickte **rohe G.711-Bytes ohne RTP-Header** an das
   Agent-Bein — der Carrier verwirft das. Jetzt wird paketiert (12-Byte-RTP-Header,
   Sequenz, Zeitstempel, SSRC) und der Payload-Typ aus dem Agent-SDP übernommen
-  (PCMA bevorzugt). Noch nicht am Telefon verifiziert.
+  (PCMA bevorzugt). Zusätzlich fehlte `TRUNK_LOCAL_IP` — das Agent-SDP warb
+  `0.0.0.0` als Medienadresse an, damit kann keine Seite Audio schicken.
+  Jetzt: `TRUNK_LOCAL_IP=212.87.214.9`, plus Statistik-Log alle 3 s
+  (`caller_frames`, `ai_frames`, `agent_frames`, `agent_rtp`, `pt`).
 
 ## Architektur
 
