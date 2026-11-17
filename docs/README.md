@@ -108,6 +108,21 @@ patches/trunk.py            kleiner SIP-Client (REGISTER + INVITE mit Digest)
 - Durchstellen testen (Bridge Anrufer ↔ Mitarbeiter)
 - `opener.wav` fehlt, Begrüßung läuft über TTS
 
+## EDEKA-Tools im Adapter
+
+Der Adapter nutzt die bestehenden Markt-Endpunkte (kein neuer Code):
+
+```
+WORKER_BASE_URL  https://jambonz.gofonia.de
+SEARCH_URL       https://jambonz.gofonia.de/tool/search   (Produktsuche, Preise)
+ORDER_URL        https://jambonz.gofonia.de/s2s/order     (Bestellung)
+Tenant-Resolver  /tenant/by-did?did=…  -> unbekannte DID faellt auf lokalen Prompt zurueck
+Prompt           live/agent_prompt.yaml = Markt-Prompt + Warmtransfer-Regeln
+```
+
+Damit kann ein Anrufer bestellen (Artikel, Menge, Preis) und danach zum
+Mitarbeiter durchgestellt werden.
+
 ## Abhaengigkeiten, gespiegelt
 
 - Fork: https://github.com/livedialai/drachtio-server (MIT, voller Upstream-Verlauf)
