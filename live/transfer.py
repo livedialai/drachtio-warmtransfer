@@ -330,6 +330,8 @@ class TransferController:
                 except Exception:  # noqa: BLE001
                     pass
                 await asyncio.sleep(0.02)
+            # kurze Pause, damit die Ansage nicht von der Musik ueberfahren wird
+            await asyncio.sleep(0.3)
 
         while True:
             if not self.should_send_moh() or not self._moh_frames:
