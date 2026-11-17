@@ -3,3 +3,4 @@ config/router.env
 *.log
 node_modules/
 __pycache__/
+config/*.live
