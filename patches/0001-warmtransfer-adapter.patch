@@ -14,10 +14,10 @@ index fc8dd6a..b039e11 100644
 +  rufe warmtransfer_abbrechen auf und fuehre das Gespraech mit dem Kunden weiter.
 diff --git a/app/bridge/transfer.py b/app/bridge/transfer.py
 new file mode 100644
-index 0000000..92a5138
+index 0000000..a5090c5
 --- /dev/null
 +++ b/app/bridge/transfer.py
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,322 @@
 +"""Warmtransfer im Adapter selbst - ohne rtpengine, ohne drachtio.
 +
 +Der Adapter haelt das Anrufer-Bein bereits (RTP + SIP). Fuer den Transfer baut
@@ -37,6 +37,7 @@ index 0000000..92a5138
 +import asyncio
 +import os
 +import socket
++import struct
 +import wave
 +from typing import Any, Optional
 +
@@ -48,6 +49,28 @@ index 0000000..92a5138
 +logger = structlog.get_logger(__name__)
 +
 +FRAME_BYTES = 320
++
++
++def parse_sdp_payload_type(sdp: str) -> int:
++    """Waehlt den Payload-Typ aus dem SDP (PCMA bevorzugt, sonst PCMU)."""
++    for line in sdp.splitlines():
++        line = line.strip()
++        if not line.startswith("m=audio "):
++            continue
++        parts = line.split()
++        pts = []
++        for token in parts[3:]:
++            try:
++                pts.append(int(token))
++            except ValueError:
++                continue
++        if 8 in pts:
++            return 8
++        if 0 in pts:
++            return 0
++        if pts:
++            return pts[0]
++    return 8
 +
 +
 +def parse_sdp_media(sdp: str) -> tuple[str, int] | None:
@@ -85,6 +108,11 @@ index 0000000..92a5138
 +
 +        self._moh_frames: list[bytes] = []
 +        self._moh_idx = 0
++
++        self._agent_pt = 8          # aus dem SDP der Agent-Leg-Antwort
++        self._seq = 0
++        self._ts = 0
++        self._ssrc = 0x5A17C0DE
 +
 +        self._caller_frames = 0
 +        self._ai_frames = 0
@@ -151,6 +179,7 @@ index 0000000..92a5138
 +
 +            self._dialog = dialog
 +            self._agent_addr = parse_sdp_media(dialog.get("sdp", ""))
++            self._agent_pt = parse_sdp_payload_type(dialog.get("sdp", ""))
 +            logger.info("Transfer-Bein steht", target=target, agent_rtp=self._agent_addr)
 +
 +            self.mode = "briefing"
@@ -199,33 +228,47 @@ index 0000000..92a5138
 +
 +    # ---------------------------------------------------------------- Audio
 +
++    def _rtp_packet(self, g711: bytes) -> bytes:
++        """Baut ein RTP-Paket (12-Byte-Header) fuer das Agent-Bein."""
++        header = struct.pack(
++            "!BBHII",
++            0x80,                 # Version 2
++            self._agent_pt & 0x7F,
++            self._seq & 0xFFFF,
++            self._ts & 0xFFFFFFFF,
++            self._ssrc,
++        )
++        self._seq = (self._seq + 1) & 0xFFFF
++        self._ts = (self._ts + len(g711)) & 0xFFFFFFFF
++        return header + g711
++
++    def _send_to_agent(self, pcm: bytes) -> None:
++        if not (self._agent_sock and self._agent_addr):
++            return
++        payload = convert_pcm16_to_g711(pcm, "alaw" if self._agent_pt == 8 else "ulaw")
++        try:
++            self._agent_sock.sendto(self._rtp_packet(payload), self._agent_addr)
++        except OSError:
++            return
++
 +    def on_caller_pcm(self, pcm: bytes) -> None:
 +        """Audio des Anrufers (Uplink) waehrend eines Transfers."""
 +        if self.mode in ("moh",):
 +            return
 +        if self.mode == "briefing" and self._agent_sock and self._agent_addr:
-+            try:
-+                self._agent_sock.sendto(convert_pcm16_to_g711(pcm, "ulaw"), self._agent_addr)
-+                self._caller_frames += 1
-+            except OSError:
-+                pass
++            self._send_to_agent(pcm)
++            self._caller_frames += 1
 +        elif self.mode == "bridge" and self._agent_sock and self._agent_addr:
-+            try:
-+                self._agent_sock.sendto(convert_pcm16_to_g711(pcm, "ulaw"), self._agent_addr)
-+                self._caller_frames += 1
-+            except OSError:
-+                pass
++            self._send_to_agent(pcm)
++            self._caller_frames += 1
 +
 +    def on_ai_pcm(self, pcm: bytes) -> bool:
 +        """KI-Audio (Downlink). True = selbst verarbeitet, nicht an den Anrufer."""
 +        if self.mode == "ai":
 +            return False
 +        if self.mode == "briefing" and self._agent_sock and self._agent_addr:
-+            try:
-+                self._agent_sock.sendto(convert_pcm16_to_g711(pcm, "ulaw"), self._agent_addr)
-+                self._ai_frames += 1
-+            except OSError:
-+                pass
++            self._send_to_agent(pcm)
++            self._ai_frames += 1
 +        return True
 +
 +    def should_send_moh(self) -> bool:
@@ -265,7 +308,7 @@ index 0000000..92a5138
 +            payload = data[12:]
 +            if not payload:
 +                continue
-+            pcm = convert_g711_to_pcm16(payload, "ulaw")
++            pcm = convert_g711_to_pcm16(payload, "alaw" if self._agent_pt == 8 else "ulaw")
 +            self._agent_frames += 1
 +            if self.mode == "briefing":
 +                self.adapter.on_rx_pcm16_8k(pcm)

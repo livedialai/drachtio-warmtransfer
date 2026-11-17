@@ -14,12 +14,13 @@ Stand: **17.11.2026** — läuft auf einem PPH Essential 2 (2 vCPU, 2 GB), Debia
 - Signalisierung des zweiten Beins: `100 → 407 → Auth → 183 → 180 → 200 OK`
 - Rückweg, wenn das Agent-Bein endet (KI übernimmt wieder, Anrufer bleibt in der Leitung)
 
-## Was nicht funktioniert
+## Was nicht funktioniert (aktualisiert 12:35)
 
-- **Briefing-Audio**: der Mitarbeiter hört die KI nicht (und umgekehrt).
-  Verdacht: das Agent-Bein verhandelt beim Carrier PCMA/G.722, der
-  `TransferController` sendet aber PCMU (Payload 0). Zu prüfen: Payload-Typ und
-  Codec aus dem SDP der Agent-Leg-Antwort übernehmen.
+- **Briefing-Audio**: der Mitarbeiter hörte die KI nicht. Ursache gefunden:
+  der `TransferController` schickte **rohe G.711-Bytes ohne RTP-Header** an das
+  Agent-Bein — der Carrier verwirft das. Jetzt wird paketiert (12-Byte-RTP-Header,
+  Sequenz, Zeitstempel, SSRC) und der Payload-Typ aus dem Agent-SDP übernommen
+  (PCMA bevorzugt). Noch nicht am Telefon verifiziert.
 
 ## Architektur
 
