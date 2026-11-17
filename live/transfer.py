@@ -179,6 +179,11 @@ class TransferController:
             # Nachhall der Ankuendigung an den Anrufer nicht an den Mitarbeiter
             self._mute_ai_until = time.monotonic() + 0.6
             self.mode = "briefing"
+
+            # Kurz vorfuellen, damit der Start des Briefings nicht stockt
+            prime_deadline = time.monotonic() + 1.5
+            while time.monotonic() < prime_deadline and len(self._agent_tx) < 10:
+                await asyncio.sleep(0.05)
             self._start_task(self._agent_recv_task())
             self._start_task(self._agent_keepalive_task())
             return {"ok": True, "status": "briefing", "agent_rtp": list(self._agent_addr)}
