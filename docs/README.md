@@ -14,7 +14,19 @@ Stand: **17.11.2026** — läuft auf einem PPH Essential 2 (2 vCPU, 2 GB), Debia
 - Signalisierung des zweiten Beins: `100 → 407 → Auth → 183 → 180 → 200 OK`
 - Rückweg, wenn das Agent-Bein endet (KI übernimmt wieder, Anrufer bleibt in der Leitung)
 
-## Was nicht funktioniert (aktualisiert 12:35)
+## Stand 17.11.2026 (final)
+
+- Eingehender Anruf, Opener, Dialog, Transfer, MOH, Briefing, Durchstellen und
+  Rueckweg laufen am Telefon.
+- Ansage "Einen Moment bitte" ist eine feste TTS-Datei (kein Live-Dialog mehr).
+- Briefing-Audio wird gepuffert (15 s) und im 20-ms-Takt gesendet, damit die
+  KI-Schuebe keine Woerter verschlucken.
+- Umfang eigener Code: ~1.230 Zeilen (Router 251, Transfer 447, SIP-Client 370,
+  Adapter-Aenderungen 163) plus 82 Zeilen Systemd/Config.
+
+Details und die zwoelf Fallstricke: siehe `skill/SKILL.md`.
+
+## Historisch: was nicht funktionierte (aktualisiert 12:35)
 
 - **Briefing-Audio**: der Mitarbeiter hörte die KI nicht. Ursache gefunden:
   der `TransferController` schickte **rohe G.711-Bytes ohne RTP-Header** an das
