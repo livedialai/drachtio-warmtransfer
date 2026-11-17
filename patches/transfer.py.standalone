@@ -95,7 +95,7 @@ class TransferController:
         self._last_agent_send = 0.0
         self._last_ai_audio = 0.0
         self._silence = b""
-        self._agent_tx = deque(maxlen=50)
+        self._agent_tx = deque(maxlen=25)
         self._seq = 0
         self._ts = 0
         self._ssrc = 0x5A17C0DE
@@ -257,12 +257,10 @@ class TransferController:
 
     def on_caller_pcm(self, pcm: bytes) -> None:
         """Audio des Anrufers (Uplink) waehrend eines Transfers."""
-        if self.mode in ("moh",):
+        # MOH und Briefing: Anrufer ist geparkt, sein Audio wird nicht weitergegeben
+        if self.mode != "bridge":
             return
-        if self.mode == "briefing" and self._agent_sock and self._agent_addr:
-            self._agent_tx.append(pcm)
-            self._caller_frames += 1
-        elif self.mode == "bridge" and self._agent_sock and self._agent_addr:
+        if self._agent_sock and self._agent_addr:
             self._agent_tx.append(pcm)
             self._caller_frames += 1
 
@@ -298,7 +296,15 @@ class TransferController:
 
     async def _agent_keepalive_task(self) -> None:
         """Haelt den RTP-Strom zum Mitarbeiter offen (Stille, wenn die KI schweigt)."""
+        loop = asyncio.get_running_loop()
+        next_tick = loop.time()
         while True:
+            next_tick += 0.02
+            delay = next_tick - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            else:
+                next_tick = loop.time()
             if self.mode in ("briefing", "bridge") and self._agent_sock and self._agent_addr:
                 # genau ein Frame pro 20 ms: echter Audioframe, sonst Stille
                 pcm = self._agent_tx.popleft() if self._agent_tx else None
@@ -312,7 +318,6 @@ class TransferController:
                     self._agent_sock.sendto(self._rtp_packet(payload), self._agent_addr)
                 except OSError:
                     pass
-            await asyncio.sleep(0.02)
 
     async def _agent_recv_task(self) -> None:
         """Audio des Mitarbeiters: Briefing -> KI, Bridge -> Anrufer."""
