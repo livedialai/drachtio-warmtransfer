@@ -14,7 +14,13 @@ from typing import AsyncIterator, Callable, Optional
 import structlog
 
 from app.utils.codec import resample_pcm16
-from app.utils.g722 import PT_G722, G722Codec, band_energy_db
+from app.utils.g722 import (
+    PT_G722,
+    G722Codec,
+    append_hd_csv,
+    band_energy_db,
+    hf_flatness,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -260,20 +266,30 @@ class RTPProtocol(asyncio.DatagramProtocol):
                 if pcm16k:
                     sprach, hoch = band_energy_db(pcm16k)
                     session = self.session
+                    session._hd_pcm = (session._hd_pcm + pcm16k)[-32000:]
                     session._hd_frames += 1
                     session._hd_sum_sprach += sprach
                     session._hd_sum_hoch += hoch
-                    if session._hd_frames % 250 == 0:      # ~5 s
+                    if session._hd_frames % 100 == 0:      # ~2 s
+                        _sp = session._hd_sum_sprach / session._hd_frames
+                        _ho = session._hd_sum_hoch / session._hd_frames
+                        _fl = hf_flatness(session._hd_pcm)
+                        append_hd_csv(
+                            session.local_port,
+                            session._hd_frames,
+                            _sp,
+                            _ho,
+                            _ho - _sp,
+                            _fl,
+                        )
                         logger.info(
                             "HD-Messung (G.722)",
+                            local_rtp_port=session.local_port,
+                            hf_flach=round(_fl, 3),
                             frames=session._hd_frames,
-                            sprach_db=round(session._hd_sum_sprach / session._hd_frames, 1),
-                            hoch_db=round(session._hd_sum_hoch / session._hd_frames, 1),
-                            differenz_db=round(
-                                (session._hd_sum_hoch - session._hd_sum_sprach)
-                                / session._hd_frames,
-                                1,
-                            ),
+                            sprach_db=round(_sp, 1),
+                            hoch_db=round(_ho, 1),
+                            differenz_db=round(_ho - _sp, 1),
                         )
                     pcm = resample_pcm16(pcm16k, 16000, 8000)
                 else:
@@ -358,6 +374,7 @@ class RTPSession:
         self.codec = G711Codec()
         self.g722 = G722Codec()
         self._hd_frames = 0
+        self._hd_pcm = b""
         self._hd_sum_sprach = 0.0
         self._hd_sum_hoch = 0.0
 

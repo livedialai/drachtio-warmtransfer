@@ -9,6 +9,9 @@ KI-Kette auf 8 kHz heruntergerechnet wird.
 """
 from __future__ import annotations
 
+import os
+from datetime import datetime, timezone
+
 import numpy as np
 
 try:  # PyAV ist optional - ohne av gibt es kein G.722
@@ -97,3 +100,45 @@ def band_energy_db(pcm16_16k: bytes) -> tuple[float, float]:
         float(10 * np.log10(sprach + eps)),
         float(10 * np.log10(hoch + eps)),
     )
+
+def hf_flatness(pcm16_16k: bytes) -> float:
+    """Spektrale Flachheit im Band 4-7,8 kHz (0 = klanglich, 1 = Rauschen).
+
+    Damit laesst sich unterscheiden, ob oberhalb von 4 kHz echte Sprache
+    liegt oder nur das Rauschen eines hochgerechneten Schmalbandsignals.
+    """
+    if len(pcm16_16k) < 512:
+        return 0.0
+    samples = np.frombuffer(pcm16_16k, dtype="<i2").astype(np.float64)
+    if samples.size < 512:
+        return 0.0
+    spec = np.abs(np.fft.rfft(samples * np.hanning(samples.size)))
+    freqs = np.fft.rfftfreq(samples.size, d=1 / 16000.0)
+    band = spec[(freqs >= 4000) & (freqs <= 7800)]
+    if band.size < 4 or band.max() <= 0:
+        return 0.0
+    band = band[band > 1e-9]
+    if band.size < 4:
+        return 0.0
+    geo = float(np.exp(np.mean(np.log(band))))
+    arith = float(np.mean(band))
+    return geo / arith if arith > 0 else 0.0
+
+_HD_CSV = os.getenv("HD_CSV", "/var/log/wt-hd.csv")
+
+
+def append_hd_csv(port: int, frames: int, sprach: float, hoch: float,
+                  diff: float, flach: float, path: str = "") -> None:
+    """Schreibt eine Messzeile direkt in eine CSV - unabhaengig vom Log-Sink."""
+    ziel = path or _HD_CSV
+    neu = not os.path.exists(ziel)
+    try:
+        with open(ziel, "a", encoding="utf-8") as fh:
+            if neu:
+                fh.write("ts,local_rtp_port,frames,sprach_db,hoch_db,diff_db,hf_flach\n")
+            fh.write(
+                f"{datetime.now(timezone.utc).isoformat(timespec='seconds')},"
+                f"{port},{frames},{sprach:.1f},{hoch:.1f},{diff:.1f},{flach:.3f}\n"
+            )
+    except OSError:
+        pass
