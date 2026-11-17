@@ -81,7 +81,8 @@ class TransferController:
         self.adapter = adapter
         self.moh_path = moh_path
 
-        self.mode = "ai"          # ai | moh | briefing | bridge
+        self.mode = "ai"
+        self._briefing_ready = False          # ai | moh | briefing | bridge
         self._trunk: Optional[TrunkClient] = None
         self._dialog: Optional[dict] = None
         self._agent_sock: Optional[socket.socket] = None
@@ -96,7 +97,7 @@ class TransferController:
         self._last_agent_send = 0.0
         self._last_ai_audio = 0.0
         self._size_counts = 0
-        self._mute_ai_until = 0.0
+        self._briefing_ready = False
         self._silence = b""
         self._agent_tx = deque(maxlen=150)
         self._seq = 0
@@ -206,6 +207,8 @@ class TransferController:
             prime_deadline = time.monotonic() + 2.5
             while time.monotonic() < prime_deadline and len(self._agent_tx) < 20:
                 await asyncio.sleep(0.05)
+            # Erst wenn der Puffer gefuellt ist, wird gesendet
+            self._briefing_ready = True
             self._start_task(self._agent_recv_task())
             self._start_task(self._agent_keepalive_task())
             return {"ok": True, "status": "briefing", "agent_rtp": list(self._agent_addr)}
@@ -234,6 +237,7 @@ class TransferController:
             t.cancel()
         self._tasks.clear()
         self.mode = "ai"
+        self._briefing_ready = False
 
         if self._dialog and self._trunk:
             try:
@@ -362,7 +366,8 @@ class TransferController:
                 next_tick = loop.time()
             if self.mode in ("briefing", "bridge") and self._agent_sock and self._agent_addr:
                 # genau ein Frame pro 20 ms: echter Audioframe, sonst Stille
-                pcm = self._agent_tx.popleft() if self._agent_tx else None
+                drain = self.mode == "bridge" or self._briefing_ready
+                pcm = self._agent_tx.popleft() if (drain and self._agent_tx) else None
                 if pcm is None:
                     payload = self._silence_payload()
                 else:
