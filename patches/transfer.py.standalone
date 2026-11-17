@@ -18,6 +18,7 @@ import asyncio
 import os
 import socket
 import struct
+import time
 import wave
 from typing import Any, Optional
 
@@ -90,6 +91,8 @@ class TransferController:
         self._moh_idx = 0
 
         self._agent_pt = 8          # aus dem SDP der Agent-Leg-Antwort
+        self._last_agent_send = 0.0
+        self._silence = b
         self._seq = 0
         self._ts = 0
         self._ssrc = 0x5A17C0DE
@@ -162,8 +165,15 @@ class TransferController:
             self._agent_pt = parse_sdp_payload_type(dialog.get("sdp", ""))
             logger.info("Transfer-Bein steht", target=target, agent_rtp=self._agent_addr)
 
+            # Restpuffer der KI verwerfen: der Satz an den Anrufer darf nicht
+            # beim Mitarbeiter landen
+            try:
+                self.adapter.clear_downlink()
+            except Exception:  # noqa: BLE001
+                pass
             self.mode = "briefing"
             self._start_task(self._agent_recv_task())
+            self._start_task(self._agent_keepalive_task())
             return {"ok": True, "status": "briefing", "agent_rtp": list(self._agent_addr)}
 
         except Exception as e:  # noqa: BLE001
@@ -208,6 +218,12 @@ class TransferController:
 
     # ---------------------------------------------------------------- Audio
 
+    def _silence_payload(self) -> bytes:
+        if not self._silence:
+            mute = b"\x00" * FRAME_BYTES
+            self._silence = convert_pcm16_to_g711(mute, "alaw" if self._agent_pt == 8 else "ulaw")
+        return self._silence
+
     def _rtp_packet(self, g711: bytes) -> bytes:
         """Baut ein RTP-Paket (12-Byte-Header) fuer das Agent-Bein."""
         header = struct.pack(
@@ -225,6 +241,7 @@ class TransferController:
     def _send_to_agent(self, pcm: bytes) -> None:
         if not (self._agent_sock and self._agent_addr):
             return
+        self._last_agent_send = time.monotonic()
         payload = convert_pcm16_to_g711(pcm, "alaw" if self._agent_pt == 8 else "ulaw")
         try:
             self._agent_sock.sendto(self._rtp_packet(payload), self._agent_addr)
@@ -271,6 +288,19 @@ class TransferController:
                 pass
             await asyncio.sleep(0.02)
             _ = loop  # keep reference for clarity
+
+    async def _agent_keepalive_task(self) -> None:
+        """Haelt den RTP-Strom zum Mitarbeiter offen (Stille, wenn die KI schweigt)."""
+        while True:
+            if self.mode in ("briefing", "bridge") and self._agent_sock and self._agent_addr:
+                if time.monotonic() - self._last_agent_send >= 0.02:
+                    payload = self._silence_payload()
+                    try:
+                        self._agent_sock.sendto(self._rtp_packet(payload), self._agent_addr)
+                        self._last_agent_send = time.monotonic()
+                    except OSError:
+                        pass
+            await asyncio.sleep(0.02)
 
     async def _agent_recv_task(self) -> None:
         """Audio des Mitarbeiters: Briefing -> KI, Bridge -> Anrufer."""
