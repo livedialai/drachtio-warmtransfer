@@ -19,6 +19,7 @@ import os
 import socket
 import struct
 import time
+from collections import deque
 import wave
 from typing import Any, Optional
 
@@ -93,6 +94,7 @@ class TransferController:
         self._agent_pt = 8          # aus dem SDP der Agent-Leg-Antwort
         self._last_agent_send = 0.0
         self._silence = b""
+        self._agent_tx = deque(maxlen=50)
         self._seq = 0
         self._ts = 0
         self._ssrc = 0x5A17C0DE
@@ -253,10 +255,10 @@ class TransferController:
         if self.mode in ("moh",):
             return
         if self.mode == "briefing" and self._agent_sock and self._agent_addr:
-            self._send_to_agent(pcm)
+            self._agent_tx.append(pcm)
             self._caller_frames += 1
         elif self.mode == "bridge" and self._agent_sock and self._agent_addr:
-            self._send_to_agent(pcm)
+            self._agent_tx.append(pcm)
             self._caller_frames += 1
 
     def on_ai_pcm(self, pcm: bytes) -> bool:
@@ -264,7 +266,7 @@ class TransferController:
         if self.mode == "ai":
             return False
         if self.mode == "briefing" and self._agent_sock and self._agent_addr:
-            self._send_to_agent(pcm)
+            self._agent_tx.append(pcm)
             self._ai_frames += 1
         return True
 
@@ -293,13 +295,18 @@ class TransferController:
         """Haelt den RTP-Strom zum Mitarbeiter offen (Stille, wenn die KI schweigt)."""
         while True:
             if self.mode in ("briefing", "bridge") and self._agent_sock and self._agent_addr:
-                if time.monotonic() - self._last_agent_send >= 0.02:
+                # genau ein Frame pro 20 ms: echter Audioframe, sonst Stille
+                pcm = self._agent_tx.popleft() if self._agent_tx else None
+                if pcm is None:
                     payload = self._silence_payload()
-                    try:
-                        self._agent_sock.sendto(self._rtp_packet(payload), self._agent_addr)
-                        self._last_agent_send = time.monotonic()
-                    except OSError:
-                        pass
+                else:
+                    payload = convert_pcm16_to_g711(
+                        pcm, "alaw" if self._agent_pt == 8 else "ulaw"
+                    )
+                try:
+                    self._agent_sock.sendto(self._rtp_packet(payload), self._agent_addr)
+                except OSError:
+                    pass
             await asyncio.sleep(0.02)
 
     async def _agent_recv_task(self) -> None:
