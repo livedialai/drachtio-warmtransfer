@@ -130,3 +130,52 @@ Mitarbeiter durchgestellt werden.
 - Fertiges Binary: Release `cd1a1d0-x86_64` im Fork (3,2 MB, gestrippt)
 - Build-Anleitung inkl. Stolpersteine (`libtool-bin`, Swap bei 2 GB, jambonz-Fork-Falle):
   `warmtransfer/BUILD.md`
+
+## Codecs und HD-Telefonie (Stand 17.11.2026)
+
+### Was heute laeuft
+
+| Strecke | Codec | Rate |
+|---|---|---|
+| Anrufer -> Adapter | G.711 A-law (PT 8) | 8 kHz, 160 Byte / 20 ms |
+| Adapter -> Mitarbeiter | G.711 u-law (PT 0) | 8 kHz |
+| Adapter <-> KI | audio/pcmu | 8 kHz |
+| angenommen, falls geboten | G.722 (PT 9) | 16 kHz, Dekoder via libavcodec |
+
+G.722 wird per `G722_ENABLE=1` akzeptiert: 160 Byte Payload werden zu
+640 Byte PCM16 (320 Samples @ 16 kHz) dekodiert, gemessen und fuer die
+KI auf 8 kHz heruntergerechnet.
+
+### Messung: kommt HD wirklich an?
+
+`/var/log/wt-hd.csv`, alle 2 s eine Zeile:
+`ts, local_rtp_port, frames, sprach_db, hoch_db, diff_db, hf_flach`
+
+| Anruf | Hochband vs. Sprachband | Bewertung |
+|---|---|---|
+| VoLTE/GSM mit HD-Anzeige | -5,0 bis +1,7 dB | echtes Breitband |
+| SIP-Softphone (G.711) | -15,1 bis -10,0 dB | schmalbandig |
+| Selbsttest 6-kHz-Ton | +21,4 dB | Messkette verifiziert |
+
+Erkenntnis: AMR-WB aus dem Mobilfunk und G.722 aus dem Festnetz kommen
+durch den easybell-Trunk als Breitband an. Ein hochgerechnetes
+Schmalbandsignal liegt dagegen 30-60 dB unter dem Sprachband.
+
+`hf_flach` (spektrale Flachheit 4-7,8 kHz) trennt **nicht** zuverlaessig:
+ein echter Breitbandkanal hat oberhalb 4 kHz ebenfalls Rauschen, also
+ebenfalls hohe Flachheit. Belastbar ist der Pegel (diff_db).
+
+### Offene Aufgabe: HD bis zur KI durchreichen
+
+Heute wird das 16-kHz-Signal im Adapter auf 8 kHz reduziert (lineare
+Interpolation, kein Anti-Aliasing) - der HD-Gewinn geht dort verloren.
+
+``` 
+1. KI-Client auf pcm16 @ 24 kHz (PCM16_SAMPLE_RATE existiert bereits)
+2. Abtastrate pro Anruf: 8 kHz bei G.711, 16 kHz bei G.722
+3. Resampler 24k <-> 16k als Polyphase statt linear (Aliasing)
+Aufwand: ~halber Tag, keine neue Abhaengigkeit
+```
+
+Nicht gebaut, weil fuer Piloten Warmtransfer und Bestellung Prioritaet
+haben. Erst sinnvoll, wenn ein Kunde HD ausdruecklich verlangt.
