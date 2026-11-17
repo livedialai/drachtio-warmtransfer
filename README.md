@@ -107,3 +107,11 @@ patches/trunk.py            kleiner SIP-Client (REGISTER + INVITE mit Digest)
 - Rückweg testen (Agent legt auf → KI übernimmt)
 - Durchstellen testen (Bridge Anrufer ↔ Mitarbeiter)
 - `opener.wav` fehlt, Begrüßung läuft über TTS
+
+## Abhaengigkeiten, gespiegelt
+
+- Fork: https://github.com/livedialai/drachtio-server (MIT, voller Upstream-Verlauf)
+- Spiegel: https://codeberg.org/weserai/drachtio-server
+- Fertiges Binary: Release `cd1a1d0-x86_64` im Fork (3,2 MB, gestrippt)
+- Build-Anleitung inkl. Stolpersteine (`libtool-bin`, Swap bei 2 GB, jambonz-Fork-Falle):
+  `warmtransfer/BUILD.md`
