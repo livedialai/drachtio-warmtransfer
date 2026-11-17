@@ -1,0 +1,16 @@
+[Unit]
+Description=sip-to-ai Bridge (Inworld) - Warmtransfer-Testkiste
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/voice-ai-stack/sip-to-ai
+ExecStart=/opt/voice-ai-stack/sip-to-ai/.venv/bin/python -m app.main
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/sip-to-ai.log
+StandardError=append:/var/log/sip-to-ai.log
+
+[Install]
+WantedBy=multi-user.target

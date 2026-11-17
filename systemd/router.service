@@ -1,0 +1,18 @@
+[Unit]
+Description=drachtio Warmtransfer-Router (sip-to-ai)
+After=network-online.target drachtio.service rtpengine.service
+Wants=network-online.target
+Requires=drachtio.service rtpengine.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/voice-ai-stack/router
+EnvironmentFile=/opt/voice-ai-stack/router.env
+ExecStart=/usr/bin/node index.js
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/wt-router.log
+StandardError=append:/var/log/wt-router.log
+
+[Install]
+WantedBy=multi-user.target

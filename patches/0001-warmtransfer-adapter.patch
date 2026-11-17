@@ -1,0 +1,1084 @@
+diff --git a/agent_prompt.yaml b/agent_prompt.yaml
+index fc8dd6a..b039e11 100644
+--- a/agent_prompt.yaml
++++ b/agent_prompt.yaml
+@@ -8,3 +8,9 @@ instructions: |
+   Wiederhole am Ende die Positionen und die Summe.
+   Wenn du etwas nicht verstehst, frage ruhig nach.
+   Sage nie, dass du ein Sprachmodell bist, außer der Kunde fragt direkt danach.
++
++  Warmtransfer: Wenn der Kunde ausdruecklich einen Menschen sprechen will, rufe
++  warmtransfer_starten auf. Sage dabei kurz "Einen Moment, ich verbinde Sie" und
++  schildere dem Mitarbeiter danach in einem Satz das Anliegen. Stimmt der Mitarbeiter
++  zu, rufe warmtransfer_durchstellen auf; lehnt er ab oder ist nicht erreichbar,
++  rufe warmtransfer_abbrechen auf und fuehre das Gespraech mit dem Kunden weiter.
+diff --git a/app/bridge/transfer.py b/app/bridge/transfer.py
+new file mode 100644
+index 0000000..92a5138
+--- /dev/null
++++ b/app/bridge/transfer.py
+@@ -0,0 +1,279 @@
++"""Warmtransfer im Adapter selbst - ohne rtpengine, ohne drachtio.
++
++Der Adapter haelt das Anrufer-Bein bereits (RTP + SIP). Fuer den Transfer baut
++er ueber den Trunk ein zweites Bein zum Mitarbeiter auf und mischt intern:
++
++  moh       Anrufer hoert Wartemusik, KI-Audio wird verworfen
++  briefing  KI spricht mit dem Mitarbeiter (Anrufer hoert weiter MOH)
++  bridge    Anrufer und Mitarbeiter sind direkt verbunden, KI ist raus
++
++Rueckweg: bricht der Mitarbeiter ab (Reject/Timeout/Auflegen), geht es ohne
++SIP-Aktion zurueck in den KI-Dialog - der Anrufer merkt nur, dass die Musik
++aufhoert.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import os
++import socket
++import wave
++from typing import Any, Optional
++
++import structlog
++
++from app.sip_async.trunk import TrunkClient, TrunkConfig, build_sdp
++from app.utils.codec import convert_g711_to_pcm16, convert_pcm16_to_g711
++
++logger = structlog.get_logger(__name__)
++
++FRAME_BYTES = 320
++
++
++def parse_sdp_media(sdp: str) -> tuple[str, int] | None:
++    """Liest c= und m=audio aus einem SDP."""
++    ip = None
++    port = None
++    for line in sdp.splitlines():
++        line = line.strip()
++        if line.startswith("c=IN IP4 "):
++            ip = line.split()[-1]
++        elif line.startswith("m=audio "):
++            try:
++                port = int(line.split()[1])
++            except (IndexError, ValueError):
++                port = None
++    if ip and port:
++        return (ip, port)
++    return None  # 160 Samples * 2 Byte = 20 ms @ 8 kHz
++
++
++class TransferController:
++    """Steuert das zweite Bein und die Audio-Wege waehrend eines Transfers."""
++
++    def __init__(self, rtp: Any, adapter: Any, moh_path: str) -> None:
++        self.rtp = rtp
++        self.adapter = adapter
++        self.moh_path = moh_path
++
++        self.mode = "ai"          # ai | moh | briefing | bridge
++        self._trunk: Optional[TrunkClient] = None
++        self._dialog: Optional[dict] = None
++        self._agent_sock: Optional[socket.socket] = None
++        self._agent_addr: Optional[tuple[str, int]] = None
++        self._tasks: list[asyncio.Task[None]] = []
++
++        self._moh_frames: list[bytes] = []
++        self._moh_idx = 0
++
++        self._caller_frames = 0
++        self._ai_frames = 0
++        self._agent_frames = 0
++
++    # ------------------------------------------------------------------ Setup
++
++    def _load_moh(self) -> None:
++        if self._moh_frames or not os.path.exists(self.moh_path):
++            return
++        with wave.open(self.moh_path, "rb") as w:
++            if w.getnchannels() != 1 or w.getsampwidth() != 2:
++                logger.warning("MOH nicht 8 kHz mono s16le", path=self.moh_path)
++                return
++            data = w.readframes(w.getnframes())
++        self._moh_frames = [
++            data[i:i + FRAME_BYTES] for i in range(0, len(data) - FRAME_BYTES, FRAME_BYTES)
++        ]
++        logger.info("MOH geladen", frames=len(self._moh_frames))
++
++    def _trunk_config(self) -> TrunkConfig:
++        return TrunkConfig(
++            domain=os.getenv("TRUNK_DOMAIN", "voip.easybell.de"),
++            user=os.getenv("TRUNK_USER", ""),
++            password=os.getenv("TRUNK_PASS", ""),
++            caller_id=os.getenv("TRUNK_CLI", ""),
++            local_port=int(os.getenv("TRUNK_LOCAL_PORT", "5070")),
++        )
++
++    # --------------------------------------------------------------- Steuerung
++
++    async def start(self, target: str) -> dict[str, Any]:
++        """Parkt den Anrufer (MOH) und baut das Bein zum Mitarbeiter auf."""
++        if self.mode != "ai":
++            return {"ok": True, "status": "laeuft_bereits", "mode": self.mode}
++
++        self._load_moh()
++        self.mode = "moh"
++        self._start_task(self._moh_task())
++
++        try:
++            self._trunk = TrunkClient(self._trunk_config())
++            await self._trunk.open()
++            # Kein REGISTER: der Anruf kommt ueber den bestehenden Kontakt rein.
++            # Eine zweite Registrierung wuerde den Inbound-Kontakt ueberschreiben.
++            if os.getenv("TRANSFER_REGISTER", "0") == "1":
++                if not await self._trunk.register():
++                    logger.warning("Trunk-Registrierung fuer Transfer fehlgeschlagen")
++
++            self._agent_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++            self._agent_sock.bind(("0.0.0.0", 0))
++            self._agent_sock.setblocking(False)
++            agent_port = self._agent_sock.getsockname()[1]
++
++            cfg = self._trunk.cfg
++            sdp = build_sdp(cfg.local_ip, agent_port)
++            dialog = await self._trunk.invite(target, sdp, timeout=35.0)
++            status = int(dialog.get("status") or 0)
++
++            if status != 200:
++                logger.info("Transfer-Ziel nicht erreicht", status=status, reason=dialog.get("reason"))
++                await self._reset()
++                return {"ok": False, "status": status, "reason": dialog.get("reason", "")}
++
++            self._dialog = dialog
++            self._agent_addr = parse_sdp_media(dialog.get("sdp", ""))
++            logger.info("Transfer-Bein steht", target=target, agent_rtp=self._agent_addr)
++
++            self.mode = "briefing"
++            self._start_task(self._agent_recv_task())
++            return {"ok": True, "status": "briefing", "agent_rtp": list(self._agent_addr)}
++
++        except Exception as e:  # noqa: BLE001
++            logger.error("Transfer-Start fehlgeschlagen", error=str(e), exc_info=True)
++            await self._reset()
++            return {"ok": False, "status": "fehler", "reason": str(e)}
++
++    async def complete(self) -> dict[str, Any]:
++        """Durchstellen: Anrufer und Mitarbeiter direkt verbinden."""
++        if self.mode != "briefing" or self._agent_addr is None:
++            return {"ok": False, "status": "kein_briefing"}
++        self.mode = "bridge"
++        logger.info("Transfer durchgestellt")
++        return {"ok": True, "status": "bridge"}
++
++    async def cancel(self) -> dict[str, Any]:
++        """Rueckweg: Mitarbeiter auflegen, Anrufer landet wieder bei der KI."""
++        logger.info("Transfer abgebrochen - Rueckweg zur KI", mode=self.mode)
++        await self._reset()
++        return {"ok": True, "status": "zurueck_bei_ki"}
++
++    async def _reset(self) -> None:
++        for t in self._tasks:
++            t.cancel()
++        self._tasks.clear()
++        self.mode = "ai"
++
++        if self._dialog and self._trunk:
++            try:
++                await self._trunk.bye(self._dialog)
++            except Exception:  # noqa: BLE001
++                pass
++        self._dialog = None
++
++        if self._trunk:
++            self._trunk.close()
++            self._trunk = None
++        if self._agent_sock:
++            self._agent_sock.close()
++            self._agent_sock = None
++        self._agent_addr = None
++
++    # ---------------------------------------------------------------- Audio
++
++    def on_caller_pcm(self, pcm: bytes) -> None:
++        """Audio des Anrufers (Uplink) waehrend eines Transfers."""
++        if self.mode in ("moh",):
++            return
++        if self.mode == "briefing" and self._agent_sock and self._agent_addr:
++            try:
++                self._agent_sock.sendto(convert_pcm16_to_g711(pcm, "ulaw"), self._agent_addr)
++                self._caller_frames += 1
++            except OSError:
++                pass
++        elif self.mode == "bridge" and self._agent_sock and self._agent_addr:
++            try:
++                self._agent_sock.sendto(convert_pcm16_to_g711(pcm, "ulaw"), self._agent_addr)
++                self._caller_frames += 1
++            except OSError:
++                pass
++
++    def on_ai_pcm(self, pcm: bytes) -> bool:
++        """KI-Audio (Downlink). True = selbst verarbeitet, nicht an den Anrufer."""
++        if self.mode == "ai":
++            return False
++        if self.mode == "briefing" and self._agent_sock and self._agent_addr:
++            try:
++                self._agent_sock.sendto(convert_pcm16_to_g711(pcm, "ulaw"), self._agent_addr)
++                self._ai_frames += 1
++            except OSError:
++                pass
++        return True
++
++    def should_send_moh(self) -> bool:
++        return self.mode in ("moh", "briefing")
++
++    async def _moh_task(self) -> None:
++        """Schickt Wartemusik an den Anrufer, solange er geparkt ist."""
++        loop = asyncio.get_running_loop()
++        while True:
++            if not self.should_send_moh() or not self._moh_frames:
++                await asyncio.sleep(0.02)
++                continue
++            frame = self._moh_frames[self._moh_idx % len(self._moh_frames)]
++            self._moh_idx += 1
++            try:
++                await self.rtp.send_audio(frame)
++            except Exception:  # noqa: BLE001
++                pass
++            await asyncio.sleep(0.02)
++            _ = loop  # keep reference for clarity
++
++    async def _agent_recv_task(self) -> None:
++        """Audio des Mitarbeiters: Briefing -> KI, Bridge -> Anrufer."""
++        assert self._agent_sock is not None
++        loop = asyncio.get_running_loop()
++        while True:
++            try:
++                data, _addr = await asyncio.wait_for(
++                    loop.sock_recvfrom(self._agent_sock, 2048), timeout=1.0
++                )
++            except asyncio.TimeoutError:
++                continue
++            except OSError:
++                return
++            if len(data) < 13:
++                continue
++            payload = data[12:]
++            if not payload:
++                continue
++            pcm = convert_g711_to_pcm16(payload, "ulaw")
++            self._agent_frames += 1
++            if self.mode == "briefing":
++                self.adapter.on_rx_pcm16_8k(pcm)
++            elif self.mode == "bridge":
++                try:
++                    await self.rtp.send_audio(pcm)
++                except Exception:  # noqa: BLE001
++                    pass
++
++    def _start_task(self, coro: Any) -> None:
++        task = asyncio.create_task(coro)
++        self._tasks.append(task)
++
++    def stats(self) -> dict[str, int | str]:
++        return {
++            "mode": self.mode,
++            "caller_frames": self._caller_frames,
++            "ai_frames": self._ai_frames,
++            "agent_frames": self._agent_frames,
++        }
++
++
++ACTIVE: dict[str, "TransferController"] = {}
++
++
++def get(call_id: str) -> "TransferController | None":
++    """Liefert den Transfer-Controller zu einer Call-ID."""
++    return ACTIVE.get(str(call_id))
++
++
++__all__ = ["TransferController", "ACTIVE", "get", "FRAME_BYTES"]
+diff --git a/app/main.py b/app/main.py
+index 404ee17..ce4aedf 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -2,6 +2,7 @@
+ 
+ import asyncio
+ import logging
++import os
+ import signal
+ import sys
+ from typing import Any, Optional
+@@ -204,7 +205,7 @@ async def create_ai_client(call: Any = None) -> AiDuplexClient:
+                 f'jetzt mit genau diesen Worten, ohne Zusatz: "{greeting}"'
+             )
+         state = CallState(
+-            call_id=str(getattr(call, "call_id", "") or ""),
++            call_id=str(getattr(call, "router_call_id", "") or getattr(call, "call_id", "") or ""),
+             did=did,
+             ani=ani,
+             tenant_id=int(tenant.get("id") or 0) if tenant else 0,
+@@ -237,6 +238,8 @@ async def create_ai_client(call: Any = None) -> AiDuplexClient:
+             phrases=(tenant or {}).get("phrases") or {},
+             max_steps=int((tenant or {}).get("max_tool_steps") or 6),
+             transfer_fn=_do_transfer,
++            router_url=os.getenv("ROUTER_URL") or "http://127.0.0.1:3001",
++            warmtranser_target=transfer_number,
+         )
+         logger.info("tools enabled", count=len(runner.tools), call_id=state.call_id)
+ 
+diff --git a/app/sip_async/async_call.py b/app/sip_async/async_call.py
+index 6b51b1e..287f012 100644
+--- a/app/sip_async/async_call.py
++++ b/app/sip_async/async_call.py
+@@ -4,6 +4,7 @@ Manages a single SIP call with RTP session, audio bridge, and AI integration.
+ """
+ 
+ import asyncio
++import os
+ import contextlib
+ import random
+ import uuid
+@@ -92,6 +93,8 @@ class AsyncCall:
+         self.sip = sip_server
+         self.local_ip = local_ip
+         self.local_rtp_port = local_rtp_port
++        # Call-ID des vorgelagerten Routers (drachtio) — gesetzt vom SIP-Server
++        self.router_call_id = ""
+ 
+         # Parse SDP from INVITE
+         sdp = parse_sdp(invite.body)
+@@ -184,6 +187,23 @@ class AsyncCall:
+         self.audio_adapter = audio_adapter
+         self.audio_bridge = RTPAudioBridge(self.rtp_session, audio_adapter)
+ 
++        # Warmtransfer: Controller an die Bridge haengen und global registrieren
++        self.transfer = None
++        if getattr(self, "router_call_id", "") or self.call_id:
++            try:
++                from app.bridge.transfer import TransferController, ACTIVE
++
++                self.transfer = TransferController(
++                    self.rtp_session,
++                    audio_adapter,
++                    os.getenv("MOH_FILE", "/opt/voice-ai-stack/moh/wartemusik.wav"),
++                )
++                self.audio_bridge.transfer = self.transfer
++                ACTIVE[str(getattr(self, "router_call_id", "") or self.call_id)] = self.transfer
++                ACTIVE[str(self.call_id)] = self.transfer
++            except Exception as e:  # noqa: BLE001
++                logger.error("Transfer-Controller nicht erstellt", error=str(e))
++
+         # Store AI session
+         self.call_session = call_session
+ 
+diff --git a/app/sip_async/async_sip_server.py b/app/sip_async/async_sip_server.py
+index b4dc42c..d0af562 100644
+--- a/app/sip_async/async_sip_server.py
++++ b/app/sip_async/async_sip_server.py
+@@ -419,6 +419,15 @@ class AsyncSIPServer:
+ 
+             # DID/ANI einmal an der Kante festhalten (E164 normalisiert)
+             call.identity = extract_identity(invite)
++            # Router-Call-ID (drachtio-Leg) mitschleppen, damit Tool-Calls den
++            # richtigen Anruf im Router treffen
++            try:
++                _xcid = invite.headers.get("X-Call-ID") or invite.headers.get("x-call-id") or ""
++                if isinstance(_xcid, list):
++                    _xcid = _xcid[0] if _xcid else ""
++                call.router_call_id = str(_xcid).strip()
++            except Exception:  # noqa: BLE001
++                call.router_call_id = ""
+             logger.info(
+                 "call_identity",
+                 call_id=call_id,
+diff --git a/app/sip_async/audio_bridge.py b/app/sip_async/audio_bridge.py
+index 8de793c..d041e49 100644
+--- a/app/sip_async/audio_bridge.py
++++ b/app/sip_async/audio_bridge.py
+@@ -50,6 +50,9 @@ class RTPAudioBridge:
+         self.adapter.add_downlink_clear_listener(self.rtp.clear_tx_queue)
+ 
+         # Statistics
++        # Warmtransfer (optional): uebernimmt die Audiowege, wenn gesetzt
++        self.transfer: object | None = None
++
+         self._uplink_frames = 0
+         self._downlink_frames = 0
+         self._uplink_silence_frames = 0
+@@ -146,6 +149,11 @@ class RTPAudioBridge:
+                         )
+                     deadline = loop.time() + self.SILENCE_AFTER
+ 
++                if self.transfer is not None and getattr(self.transfer, "mode", "ai") != "ai":
++                    self.transfer.on_caller_pcm(pcm_data)
++                    self._uplink_frames += 1
++                    continue
++
+                 # Feed PCM16 @ 8kHz to AudioAdapter
+                 # AudioAdapter expects 320 bytes (160 samples * 2 bytes)
+                 self.adapter.on_rx_pcm16_8k(pcm_data)
+@@ -189,6 +197,11 @@ class RTPAudioBridge:
+                 # This blocks until data is available
+                 pcm_data = await self.adapter.get_downlink_audio()
+ 
++                if self.transfer is not None and self.transfer.on_ai_pcm(pcm_data):
++                    # Transfer aktiv: KI-Audio geht an den Mitarbeiter, nicht an den Anrufer
++                    self._downlink_frames += 1
++                    continue
++
+                 # Send to RTP
+                 await self.rtp.send_audio(pcm_data)
+ 
+diff --git a/app/sip_async/trunk.py b/app/sip_async/trunk.py
+new file mode 100644
+index 0000000..d20b45d
+--- /dev/null
++++ b/app/sip_async/trunk.py
+@@ -0,0 +1,370 @@
++"""Minimaler SIP-Trunk-Client (REGISTER + ausgehender INVITE mit Digest-Auth).
++
++Wird vom Warmtransfer gebraucht: der Adapter selbst baut das zweite Bein zum
++Mitarbeiter auf, ohne rtpengine und ohne drachtio.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import os
++import random
++import socket
++import struct
++import time
++from dataclasses import dataclass, field
++from typing import Optional
++
++import structlog
++
++logger = structlog.get_logger(__name__)
++
++
++def _rand(n: int = 8) -> str:
++    return "".join(random.choice("0123456789abcdef") for _ in range(n))
++
++
++def _sdp_of(msg: str) -> str:
++    """Liefert den SDP-Body einer SIP-Nachricht."""
++    parts = msg.split("\r\n\r\n", 1)
++    return parts[1] if len(parts) > 1 else ""
++
++
++def _parse_headers(msg: str) -> dict[str, str]:
++    out: dict[str, str] = {}
++    for line in msg.split("\r\n")[1:]:
++        if not line or ":" not in line:
++            continue
++        k, v = line.split(":", 1)
++        k = k.strip().lower()
++        if k in out:
++            out[k] += ", " + v.strip()
++        else:
++            out[k] = v.strip()
++    return out
++
++
++def _digest_authorization(
++    method: str,
++    uri: str,
++    challenge: str,
++    username: str,
++    password: str,
++) -> str:
++    """Baut den Authorization-Header aus einer WWW-Authenticate/Proxy-Authenticate-Zeile."""
++    params: dict[str, str] = {}
++    body = challenge.split(" ", 1)[1] if " " in challenge else ""
++    for part in body.split(","):
++        if "=" not in part:
++            continue
++        k, v = part.split("=", 1)
++        params[k.strip().lower()] = v.strip().strip('"')
++
++    realm = params.get("realm", "")
++    nonce = params.get("nonce", "")
++    qop = params.get("qop", "")
++    opaque = params.get("opaque")
++    algorithm = params.get("algorithm", "MD5")
++
++    def h(x: str) -> str:
++        return hashlib.md5(x.encode()).hexdigest()
++
++    ha1 = h(f"{username}:{realm}:{password}")
++    ha2 = h(f"{method}:{uri}")
++    if "auth" in qop:
++        nc = "00000001"
++        cnonce = _rand(8)
++        response = h(f"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}")
++        extra = f', qop=auth, nc={nc}, cnonce="{cnonce}"'
++    else:
++        response = h(f"{ha1}:{nonce}:{ha2}")
++        extra = ""
++    hdr = (
++        f'Digest username="{username}", realm="{realm}", nonce="{nonce}", '
++        f'uri="{uri}", response="{response}", algorithm={algorithm}'
++    )
++    if opaque:
++        hdr += f', opaque="{opaque}"'
++    return hdr + extra
++
++
++@dataclass
++class TrunkConfig:
++    domain: str = os.getenv("TRUNK_DOMAIN", "g.vsip.eu")
++    user: str = os.getenv("TRUNK_USER", "")
++    password: str = os.getenv("TRUNK_PASS", "")
++    local_ip: str = os.getenv("TRUNK_LOCAL_IP", "0.0.0.0")
++    local_port: int = int(os.getenv("TRUNK_LOCAL_PORT", "5065"))
++    caller_id: str = os.getenv("TRUNK_CLI", "")
++    from_user: str = os.getenv("TRUNK_FROM", "")  # From/Contact-User (oft die DID)
++    contact_port: int = 0  # 0 = local_port; sonst z. B. 5060 (drachtio)
++
++
++class TrunkClient:
++    """SIP-Client für einen registrierenden Trunk (UDP, Digest-Auth)."""
++
++    def __init__(self, cfg: TrunkConfig) -> None:
++        self.cfg = cfg
++        self._sock: Optional[socket.socket] = None
++        self._last_challenge: Optional[str] = None
++        self._last_challenge_is_proxy: bool = False
++        self._remote: Optional[tuple[str, int]] = None
++
++    # ------------------------------------------------------------------ Setup
++
++    async def open(self) -> None:
++        loop = asyncio.get_running_loop()
++        info = await loop.getaddrinfo(self.cfg.domain, 5060, type=socket.SOCK_DGRAM)
++        self._remote = info[0][4][:2]
++        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        s.bind((self.cfg.local_ip, self.cfg.local_port))
++        s.setblocking(False)
++        self._sock = s
++        logger.info("trunk socket offen", remote=self._remote, local=self.cfg.local_port)
++
++    def close(self) -> None:
++        if self._sock:
++            self._sock.close()
++            self._sock = None
++
++    # ------------------------------------------------------------------ Senden
++
++    def _from_user(self) -> str:
++        # drachtio nutzt den Auth-User im From; die DID steht nur in P-Preferred-Identity
++        return self.cfg.user
++
++    def _aor(self) -> str:
++        return f"sip:{self._from_user()}@{self.cfg.domain}"
++
++    def _contact(self) -> str:
++        port = self.cfg.contact_port or self.cfg.local_port
++        return f"sip:{self._from_user()}@{self.cfg.local_ip}:{port}"
++
++    async def _send(self, data: bytes) -> None:
++        assert self._sock and self._remote
++        loop = asyncio.get_running_loop()
++        await loop.sock_sendto(self._sock, data, self._remote)
++
++    async def _recv(self, timeout: float) -> Optional[str]:
++        assert self._sock
++        loop = asyncio.get_running_loop()
++        try:
++            data = await asyncio.wait_for(loop.sock_recv(self._sock, 65535), timeout)
++        except asyncio.TimeoutError:
++            return None
++        text = data.decode(errors="replace")
++        if not text.startswith("SIP/2.0"):
++            # eingehende Requests (z. B. INVITE) ignorieren - das ist keine Antwort
++            return None
++        return text
++
++    # ------------------------------------------------------------------ REGISTER
++
++    async def register(self) -> bool:
++        call_id = f"{_rand(12)}@{self.cfg.local_ip}"
++        uri = f"sip:{self.cfg.domain}"
++        cseq = 1
++        auth_hdr = ""
++        for attempt in range(2):
++            msg = (
++                f"REGISTER {uri} SIP/2.0\r\n"
++                f"Via: SIP/2.0/UDP {self.cfg.local_ip}:{self.cfg.local_port};branch=z9hG4bK{_rand()}\r\n"
++                "Max-Forwards: 70\r\n"
++                f"From: <{self._aor()}>;tag={_rand()}\r\n"
++                f"To: <{self._aor()}>\r\n"
++                f"Call-ID: {call_id}\r\n"
++                f"CSeq: {cseq} REGISTER\r\n"
++                f"Contact: <{self._contact()}>\r\n"
++                "Expires: 300\r\n"
++                + (f"{auth_hdr}\r\n" if auth_hdr else "")
++                + "User-Agent: sip-to-ai\r\nContent-Length: 0\r\n\r\n"
++            )
++            await self._send(msg.encode())
++            resp = None
++            deadline = time.monotonic() + 8.0
++            while time.monotonic() < deadline:
++                candidate = await self._recv(max(1.0, deadline - time.monotonic()))
++                if candidate is None:
++                    break
++                # 1xx sind Zwischenmeldungen — auf die finale Antwort warten
++                status_line = candidate.split("\r\n")[0]
++                parts = status_line.split(" ")
++                if len(parts) > 1 and parts[1].isdigit() and parts[1].startswith("1"):
++                    continue
++                resp = candidate
++                break
++            if resp is None:
++                logger.warning("REGISTER ohne Antwort")
++                return False
++            status = resp.split("\r\n")[0]
++            logger.info("REGISTER Antwort", status=status)
++            if " 200 " in status:
++                return True
++            headers = _parse_headers(resp)
++            challenge = headers.get("www-authenticate") or headers.get("proxy-authenticate")
++            if not challenge:
++                return False
++            auth_hdr = "Authorization: " + _digest_authorization(
++                "REGISTER", uri, challenge, self.cfg.user, self.cfg.password
++            )
++            cseq += 1
++        return False
++
++    # ------------------------------------------------------------------ INVITE
++
++    async def invite(self, target: str, sdp_body: str, timeout: float = 35.0) -> dict:
++        """Baut einen ausgehenden Anruf auf.
++
++        Jeder Versuch ist ein eigener Dialog (neue Call-ID, neuer From-Tag,
++        neuer branch). Nach einer 401/407 wird die Antwort mit ACK bestaetigt
++        und der naechste Versuch mit den Zugangsdaten aus der Challenge
++        geschickt - so entstehen keine haengenden Transaktionen (491).
++        """
++        target_user = target.strip().replace(" ", "")
++        uri = f"sip:{target_user}@{self.cfg.domain}"
++        auth_hdr = ""
++        last_status = 0
++        last_reason = "kein Versuch"
++
++        for _attempt in range(2):
++            call_id = f"{_rand(16)}@{self.cfg.local_ip}"
++            from_tag = _rand()
++            branch = "z9hG4bK" + _rand()
++            cseq = 1
++            body = sdp_body
++
++            extra = (auth_hdr + "\r\n") if auth_hdr else ""
++            msg = (
++                f"INVITE {uri} SIP/2.0\r\n"
++                f"Via: SIP/2.0/UDP {self.cfg.local_ip}:{self.cfg.local_port};branch={branch}\r\n"
++                "Max-Forwards: 70\r\n"
++                f"From: <{self._aor()}>;tag={from_tag}\r\n"
++                f"To: <{uri}>\r\n"
++                f"Call-ID: {call_id}\r\n"
++                f"CSeq: {cseq} INVITE\r\n"
++                f"Contact: <{self._contact()}>\r\n"
++                + (f"P-Preferred-Identity: <sip:{self.cfg.caller_id}@{self.cfg.domain}>\r\n"
++                   if self.cfg.caller_id else "")
++                + extra
++                + "User-Agent: sip-to-ai\r\nContent-Type: application/sdp\r\n"
++                f"Content-Length: {len(body)}\r\n\r\n{body}"
++            )
++            await self._send(msg.encode())
++
++            challenge = None
++            deadline = time.monotonic() + timeout
++            while time.monotonic() < deadline:
++                resp = await self._recv(min(10.0, max(1.0, deadline - time.monotonic())))
++                if resp is None:
++                    continue
++                status_line = resp.split("\r\n")[0]
++                try:
++                    code = int(status_line.split(" ")[1])
++                except (IndexError, ValueError):
++                    continue
++                headers = _parse_headers(resp)
++                logger.info("INVITE Antwort", code=code, reason=status_line[:80])
++                last_status, last_reason = code, status_line
++
++                if 401 <= code <= 407:
++                    await self._ack(uri, call_id, from_tag, branch, cseq)
++                    challenge = headers.get("www-authenticate") or headers.get("proxy-authenticate")
++                    if not challenge:
++                        return {"ok": False, "status": code, "reason": status_line}
++                    hdr_name = "Authorization" if code == 401 else "Proxy-Authorization"
++                    auth_hdr = hdr_name + ": " + _digest_authorization(
++                        "INVITE", uri, challenge, self.cfg.user, self.cfg.password
++                    )
++                    self._last_challenge = challenge
++                    self._last_challenge_is_proxy = code != 401
++                    break  # neuer Dialog mit Auth
++
++                if 100 <= code < 200:
++                    # 100/180/183: weiter auf die finale Antwort warten
++                    continue
++
++                if code == 200:
++                    to_hdr = headers.get("to", "")
++                    to_tag = to_hdr.split("tag=")[-1].strip() if "tag=" in to_hdr else ""
++                    await self._ack(uri, call_id, from_tag, branch, cseq, to_tag)
++                    return {
++                        "ok": True, "status": 200, "reason": status_line,
++                        "call_id": call_id, "from_tag": from_tag, "to_tag": to_tag,
++                        "uri": uri, "sdp": _sdp_of(resp),
++                    }
++
++                await self._ack(uri, call_id, from_tag, branch, cseq)
++                return {"ok": False, "status": code, "reason": status_line}
++
++            if challenge is None:
++                return {"ok": False, "status": last_status, "reason": last_reason or "timeout"}
++
++        return {"ok": False, "status": last_status, "reason": last_reason or "auth fehlgeschlagen"}
++
++    async def _ack(self, uri: str, call_id: str, from_tag: str, branch: str,
++                   cseq: int, to_tag: str = "") -> None:
++        """Bestaetigt eine finale Antwort (verhindert haengende Transaktionen)."""
++        to = f"<{uri}>" + (f";tag={to_tag}" if to_tag else "")
++        msg = (
++            f"ACK {uri} SIP/2.0\r\n"
++            f"Via: SIP/2.0/UDP {self.cfg.local_ip}:{self.cfg.local_port};branch={branch}\r\n"
++            "Max-Forwards: 70\r\n"
++            f"From: <{self._aor()}>;tag={from_tag}\r\n"
++            f"To: {to}\r\n"
++            f"Call-ID: {call_id}\r\n"
++            f"CSeq: {cseq} ACK\r\n"
++            "Content-Length: 0\r\n\r\n"
++        )
++        try:
++            await self._send(msg.encode())
++        except OSError:
++            pass
++
++    async def bye(self, dialog: dict) -> None:
++        uri, cid = dialog["uri"], dialog["call_id"]
++        await self._send((
++            f"BYE {uri} SIP/2.0\r\n"
++            f"Via: SIP/2.0/UDP {self.cfg.local_ip}:{self.cfg.local_port};branch=z9hG4bK{_rand()}\r\n"
++            "Max-Forwards: 70\r\n"
++            f"From: <{self._aor()}>;tag={dialog['from_tag']}\r\n"
++            f"To: <{uri}>;tag={dialog['to_tag']}\r\n"
++            f"Call-ID: {cid}\r\n"
++            f"CSeq: {dialog['cseq'] + 1} BYE\r\nContent-Length: 0\r\n\r\n"
++        ).encode())
++
++
++def build_sdp(local_ip: str, rtp_port: int, codec: int = 0) -> str:
++    return (
++        "v=0\r\n"
++        f"o=- {int(time.time())} 1 IN IP4 {local_ip}\r\n"
++        "s=sip-to-ai\r\n"
++        f"c=IN IP4 {local_ip}\r\n"
++        "t=0 0\r\n"
++        f"m=audio {rtp_port} RTP/AVP {codec}\r\n"
++        f"a=rtpmap:{codec} {'PCMU' if codec == 0 else 'PCMA'}/8000\r\n"
++        "a=sendrecv\r\n"
++    )
++
++
++async def _self_test() -> None:
++    """Kleiner Funktionstest: registriert und ruft eine Nummer an."""
++    cfg = TrunkConfig(local_ip=os.getenv("TRUNK_LOCAL_IP", "212.87.214.9"))
++    t = TrunkClient(cfg)
++    await t.open()
++    ok = await t.register()
++    print("REGISTER:", ok)
++    target = os.getenv("TEST_TARGET", "")
++    if ok and target:
++        sdp = build_sdp(cfg.local_ip, 40200)
++        res = await t.invite(target, sdp)
++        print("INVITE:", {k: v for k, v in res.items() if k != "remote_sdp"})
++        if res.get("ok"):
++            await asyncio.sleep(2)
++            await t.bye(res)
++            print("BYE gesendet")
++    t.close()
++
++
++if __name__ == "__main__":
++    asyncio.run(_self_test())
+diff --git a/app/tools.py b/app/tools.py
+index 41b8028..c756c51 100644
+--- a/app/tools.py
++++ b/app/tools.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import json
++import os
+ import re
+ import urllib.request
+ from dataclasses import dataclass, field
+@@ -251,6 +252,43 @@ def build_tools() -> list[dict[str, Any]]:
+             "description": "Verbindet den Kunden mit einem Mitarbeiter. Nur wenn der Kunde ausdruecklich einen Menschen will.",
+             "parameters": {"type": "object", "properties": {"grund": {"type": "string"}}},
+         },
++        {
++            "type": "function",
++            "name": "warmtransfer_starten",
++            "description": (
++                "Parkt den Anrufer mit Wartemusik und ruft den Mitarbeiter an, damit du ihm "
++                "das Anliegen kurz schildern kannst (Briefing). Nur wenn der Kunde ausdruecklich "
++                "einen Menschen sprechen will."
++            ),
++            "parameters": {
++                "type": "object",
++                "properties": {
++                    "zielnummer": {
++                        "type": "string",
++                        "description": "Optional: abweichende Rufnummer des Mitarbeiters",
++                    },
++                    "grund": {"type": "string", "description": "Kurzes Anliegen des Kunden"},
++                },
++            },
++        },
++        {
++            "type": "function",
++            "name": "warmtransfer_durchstellen",
++            "description": (
++                "Schaltet Kunde und Mitarbeiter zusammen, nachdem der Mitarbeiter im Briefing "
++                "zugestimmt hat. Danach bist du aus dem Gespraech."
++            ),
++            "parameters": {"type": "object", "properties": {}},
++        },
++        {
++            "type": "function",
++            "name": "warmtransfer_abbrechen",
++            "description": (
++                "Bricht den Transfer ab und uebernimmst du wieder selbst das Gespraech, "
++                "wenn der Mitarbeiter ablehnt oder nicht erreichbar ist."
++            ),
++            "parameters": {"type": "object", "properties": {}},
++        },
+     ]
+ 
+ 
+@@ -265,6 +303,8 @@ class ToolRunner:
+         phrases: Optional[dict[str, str]] = None,
+         max_steps: int = 6,
+         transfer_fn: Optional[Any] = None,
++        router_url: Optional[str] = None,
++        warmtranser_target: Optional[str] = None,
+     ) -> None:
+         self.state = state
+         self.search_url = search_url
+@@ -272,6 +312,8 @@ class ToolRunner:
+         self.phrases = phrases or {}
+         self.max_steps = max_steps
+         self.transfer_fn = transfer_fn
++        self.router_url = (router_url or os.getenv("ROUTER_URL") or "http://127.0.0.1:3001").rstrip("/")
++        self.warmtranser_target = warmtranser_target or os.getenv("WARMTRANSFER_TARGET") or ""
+         self.tools = build_tools()
+ 
+     async def run(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+@@ -318,12 +360,54 @@ class ToolRunner:
+                 out = await self.transfer_fn()
+                 logger.info("transfer requested", call_id=st.call_id, result=str(out)[:160])
+                 return out
++            if name in ("warmtransfer_starten", "warmtransfer_durchstellen", "warmtransfer_abbrechen"):
++                from app.bridge.transfer import get as get_transfer
++
++                ctrl = get_transfer(st.call_id)
++                if ctrl is None:
++                    return {"ok": False, "hinweis": "Transfer ist fuer diesen Anruf nicht verfuegbar."}
++
++                if name == "warmtransfer_starten":
++                    ziel = str(args.get("zielnummer") or self.warmtranser_target or "").strip()
++                    if not ziel:
++                        return {"ok": False, "hinweis": "Keine Zielnummer fuer den Transfer hinterlegt."}
++                    out = await ctrl.start(_dial_format(ziel))
++                elif name == "warmtransfer_durchstellen":
++                    out = await ctrl.complete()
++                else:
++                    out = await ctrl.cancel()
++                logger.info("warmtransfer", step=name, call_id=st.call_id, result=str(out)[:160])
++                return out
+             return {"fehler": f"unbekanntes Tool {name}"}
+         except Exception as exc:  # noqa: BLE001
+             logger.warning("tool failed", tool=name, error=str(exc))
+             return {"fehler": str(exc)}
+ 
+ 
++def _dial_format(nummer: str) -> str:
++    """Normalisiert eine Rufnummer auf das Waehlformat des Trunks.
++
++    TRANSFER_DIAL_FORMAT: e164 (+49…), 0049 (0049…), 49 (49… — sipload).
++    """
++    fmt = (os.getenv("TRANSFER_DIAL_FORMAT") or "e164").lower()
++    dial = str(nummer).strip().replace(" ", "").replace("-", "").replace("/", "")
++    if dial.startswith("+"):
++        base = dial
++    elif dial.startswith("00"):
++        base = "+" + dial[2:]
++    elif dial.startswith("0"):
++        base = "+49" + dial[1:]
++    elif dial.startswith("49"):
++        base = "+" + dial
++    else:
++        base = "+49" + dial
++    if fmt == "e164":
++        return base
++    if fmt == "0049":
++        return "00" + base.lstrip("+")
++    return base.lstrip("+")
++
++
+ def _as_float(value: Any) -> float:
+     try:
+         return float(str(value).replace(",", "."))
+diff --git a/scripts/easybell_test.py b/scripts/easybell_test.py
+new file mode 100644
+index 0000000..14f4219
+--- /dev/null
++++ b/scripts/easybell_test.py
+@@ -0,0 +1,37 @@
++"""Easybell-Outbound-Test: REGISTER, dann INVITE mit mehreren Nummernformaten."""
++import asyncio
++import os
++
++from app.sip_async.trunk import TrunkClient, TrunkConfig, build_sdp
++
++CFG = TrunkConfig(
++    domain=os.getenv("TRUNK_DOMAIN", "voip.easybell.de"),
++    user=os.getenv("TRUNK_USER", "K4071003T3"),
++    password=os.getenv("TRUNK_PASS", ""),
++    caller_id=os.getenv("TRUNK_CLI", "4942143818790"),
++    local_port=int(os.getenv("TRUNK_LOCAL_PORT", "5070")),
++)
++TARGETS = ["004915236448398", "015236448398", "+4915236448398"]
++
++
++async def main():
++    c = TrunkClient(CFG)
++    await c.open()
++    ok = await c.register()
++    print("REGISTER:", "OK" if ok else "FEHLER")
++    if not ok:
++        return
++    for t in TARGETS:
++        res = await c.invite(t, build_sdp(CFG.local_ip, 40100))
++        print(f"{t} -> {res.get('status')} {res.get('reason', '')}".strip())
++        if res.get("status") == 200:
++            await c.bye(res)
++            print("  (aufgelegt)")
++            break
++        if res.get("status") in (180, 183):
++            print("  (klingelt)")
++            break
++    c.close()
++
++
++asyncio.run(main())
+diff --git a/scripts/registrar.py b/scripts/registrar.py
+new file mode 100644
+index 0000000..266f9e1
+--- /dev/null
++++ b/scripts/registrar.py
+@@ -0,0 +1,47 @@
++"""Haelt die Trunk-Registrierung und zeigt den Kontakt auf den SIP-Eingang.
++
++easybell beantwortet REGISTER nur mit vorab gesendeter Authentifizierung
++zuverlaessig; drachtio bekommt dort nur 408. Dieser kleine Daemon registriert
++sich selbst (Contact = <ip>:5060, also drachtio) und erneuert alle ~100 s.
++"""
++import asyncio
++import os
++import signal
++import sys
++
++sys.path.insert(0, "/opt/voice-ai-stack/sip-to-ai")
++
++from app.sip_async.trunk import TrunkClient, TrunkConfig  # noqa: E402
++
++
++async def main() -> None:
++    cfg = TrunkConfig(
++        domain=os.getenv("TRUNK_DOMAIN", "voip.easybell.de"),
++        user=os.getenv("TRUNK_USER", ""),
++        password=os.getenv("TRUNK_PASS", ""),
++        caller_id=os.getenv("TRUNK_CLI", ""),
++        local_ip=os.getenv("PUBLIC_IP", "212.87.214.9"),
++        local_port=int(os.getenv("REGISTRAR_PORT", "5072")),
++    )
++    cfg.contact_port = int(os.getenv("CONTACT_PORT", "5060"))
++
++    client = TrunkClient(cfg)
++    await client.open()
++
++    stop = asyncio.Event()
++    loop = asyncio.get_running_loop()
++    for sig in (signal.SIGINT, signal.SIGTERM):
++        loop.add_signal_handler(sig, stop.set)
++
++    while not stop.is_set():
++        ok = await client.register()
++        print(f"REGISTER {'OK' if ok else 'FEHLER'}", flush=True)
++        try:
++            await asyncio.wait_for(stop.wait(), timeout=100 if ok else 60)
++        except asyncio.TimeoutError:
++            pass
++
++    client.close()
++
++
++asyncio.run(main())
+diff --git a/scripts/try_formats.py b/scripts/try_formats.py
+new file mode 100644
+index 0000000..0900bf7
+--- /dev/null
++++ b/scripts/try_formats.py
+@@ -0,0 +1,45 @@
++"""Probiert Nummernformate fuer den ausgehenden INVITE durch, bis eines klingelt."""
++import asyncio
++import os
++
++from app.sip_async.trunk import TrunkClient, TrunkConfig, build_sdp
++
++CFG = TrunkConfig(
++    domain=os.getenv("TRUNK_DOMAIN", "g.vsip.eu"),
++    user=os.getenv("TRUNK_USER", ""),
++    password=os.getenv("TRUNK_PASS", ""),
++    local_ip=os.getenv("TRUNK_LOCAL_IP", "212.87.214.9"),
++    local_port=int(os.getenv("TRUNK_LOCAL_PORT", "5065")),
++    caller_id=os.getenv("TRUNK_CLI", ""),
++)
++
++TARGETS = [
++    "+4915236448398",
++    "015236448398",
++    "004915236448398",
++    "4915236448398",
++    "15236448398",
++]
++
++
++async def main() -> None:
++    t = TrunkClient(CFG)
++    await t.open()
++    if not await t.register():
++        print("REGISTER fehlgeschlagen")
++        return
++    sdp = build_sdp(CFG.local_ip, 40202)
++    for target in TARGETS:
++        res = await t.invite(target, sdp, timeout=12.0)
++        print(f"{target:18s} -> status={res.get('status')} {res.get('reason', 'OK')}")
++        if res.get("ok"):
++            await t.bye(res)
++            print("   -> 200 OK, BYE gesendet")
++            break
++        if res.get("status") in (180, 183):
++            print("   -> klingelt")
++            break
++    t.close()
++
++
++asyncio.run(main())

@@ -1,0 +1,11 @@
+[rtpengine]
+interface = 212.87.214.9
+listen-ng = 127.0.0.1:22222
+port-min = 30000
+port-max = 40000
+log-level = 6
+log-stderr = false
+delete-delay = 30
+timeout = 60
+silence-timeout = 60
+tos = 184

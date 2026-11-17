@@ -1,0 +1,17 @@
+[Unit]
+Description=Trunk-Registrar (easybell) fuer den SIP-Eingang
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/voice-ai-stack/sip-to-ai
+EnvironmentFile=/opt/voice-ai-stack/sip-to-ai/.env
+ExecStart=/opt/voice-ai-stack/sip-to-ai/.venv/bin/python scripts/registrar.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/wt-registrar.log
+StandardError=append:/var/log/wt-registrar.log
+
+[Install]
+WantedBy=multi-user.target

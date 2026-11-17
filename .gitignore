@@ -1,0 +1,5 @@
+config/router.env
+.env
+*.log
+node_modules/
+__pycache__/

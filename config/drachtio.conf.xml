@@ -1,0 +1,17 @@
+<drachtio>
+  <admin port="9022" secret="cymru">127.0.0.1</admin>
+  <loglevel>info</loglevel>
+  <external-ip>212.87.214.9</external-ip>
+  <sip>
+    <contacts>
+      <contact>sip:212.87.214.9:5060;transport=udp</contact>
+      <contact>sip:212.87.214.9:5060;transport=tcp</contact>
+    </contacts>
+    <spammers action="reject" tcp-action="reject">
+      <header name="User-Agent" pattern="friendly-scanner" />
+      <header name="User-Agent" pattern="sipvicious" />
+      <header name="User-Agent" pattern="sipcli" />
+      <header name="User-Agent" pattern="sip-scan" />
+    </spammers>
+  </sip>
+</drachtio>

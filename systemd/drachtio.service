@@ -1,0 +1,14 @@
+[Unit]
+Description=drachtio SIP server (Warmtransfer-Router)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/drachtio --contact "sip:212.87.214.9;transport=udp,tcp" --external-ip 212.87.214.9 --port 5060 --secret cymru --loglevel info
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

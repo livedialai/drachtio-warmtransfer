@@ -1,0 +1,11 @@
+{
+  "name": "drachtio-warmtransfer-router",
+  "version": "0.1.0",
+  "main": "index.js",
+  "private": true,
+  "dependencies": {
+    "drachtio-srf": "^5.0.29",
+    "express": "^4.19.2",
+    "rtpengine-client": "^0.4.12"
+  }
+}
