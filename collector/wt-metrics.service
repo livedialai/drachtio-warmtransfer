@@ -1,0 +1,16 @@
+[Unit]
+Description=Ressourcen-Mitschnitt Warmtransfer-Stack (CSV alle 10 s)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/voice-ai-stack/collector/metrics.py
+Restart=always
+RestartSec=5
+Nice=10
+StandardOutput=append:/var/log/wt-metrics.log
+StandardError=append:/var/log/wt-metrics.log
+
+[Install]
+WantedBy=multi-user.target
