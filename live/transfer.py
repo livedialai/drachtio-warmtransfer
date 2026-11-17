@@ -158,6 +158,11 @@ class TransferController:
         self._load_moh()
         self._load_ansage()
         self.mode = "moh"
+        # Reste der KI aus der Sendequeue werfen, damit die Ansage sofort kommt
+        try:
+            self.rtp.clear_tx_queue()
+        except Exception:  # noqa: BLE001
+            pass
         self._start_task(self._moh_task())
 
         try:
@@ -195,13 +200,11 @@ class TransferController:
                 self.adapter.clear_downlink()
             except Exception:  # noqa: BLE001
                 pass
-            # Nachhall der Ankuendigung an den Anrufer nicht an den Mitarbeiter
-            self._mute_ai_until = time.monotonic() + 0.6
             self.mode = "briefing"
 
             # Kurz vorfuellen, damit der Start des Briefings nicht stockt
-            prime_deadline = time.monotonic() + 1.5
-            while time.monotonic() < prime_deadline and len(self._agent_tx) < 10:
+            prime_deadline = time.monotonic() + 2.5
+            while time.monotonic() < prime_deadline and len(self._agent_tx) < 20:
                 await asyncio.sleep(0.05)
             self._start_task(self._agent_recv_task())
             self._start_task(self._agent_keepalive_task())
@@ -301,8 +304,6 @@ class TransferController:
         """KI-Audio (Downlink). True = selbst verarbeitet, nicht an den Anrufer."""
         if self.mode == "ai":
             return False
-        if self.mode == "briefing" and time.monotonic() < self._mute_ai_until:
-            return True
         if self.mode == "briefing" and self._agent_sock and self._agent_addr:
             self._log_sizes(pcm, "ki")
             self._agent_tx.append(pcm)
