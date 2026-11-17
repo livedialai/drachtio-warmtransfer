@@ -89,6 +89,7 @@ class TransferController:
         self._tasks: list[asyncio.Task[None]] = []
 
         self._moh_frames: list[bytes] = []
+        self._ansage_frames: list[bytes] = []
         self._moh_idx = 0
 
         self._agent_pt = 8          # aus dem SDP der Agent-Leg-Antwort
@@ -107,6 +108,21 @@ class TransferController:
         self._agent_frames = 0
 
     # ------------------------------------------------------------------ Setup
+
+    def _load_ansage(self) -> None:
+        """Fest aufgenommene Ansage 'Einen Moment bitte.' (8 kHz PCM16)."""
+        if self._ansage_frames:
+            return
+        pcm_path = os.getenv("ANSAGE_PCM", "/opt/voice-ai-stack/moh/ansage.pcm")
+        try:
+            with open(pcm_path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return
+        self._ansage_frames = [
+            data[i:i + FRAME_BYTES] for i in range(0, len(data) - FRAME_BYTES, FRAME_BYTES)
+        ]
+        logger.info("Ansage geladen", frames=len(self._ansage_frames))
 
     def _load_moh(self) -> None:
         if self._moh_frames or not os.path.exists(self.moh_path):
@@ -140,6 +156,7 @@ class TransferController:
             return {"ok": True, "status": "laeuft_bereits", "mode": self.mode}
 
         self._load_moh()
+        self._load_ansage()
         self.mode = "moh"
         self._start_task(self._moh_task())
 
@@ -303,6 +320,16 @@ class TransferController:
         """
         loop = asyncio.get_running_loop()
         block = 10
+
+        # Ansage einmal, danach Musik
+        if self._ansage_frames:
+            for frame in self._ansage_frames:
+                try:
+                    await self.rtp.send_audio(frame)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(0.02)
+
         while True:
             if not self.should_send_moh() or not self._moh_frames:
                 await asyncio.sleep(0.05)
