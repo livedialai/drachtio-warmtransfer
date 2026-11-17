@@ -92,7 +92,7 @@ class TransferController:
 
         self._agent_pt = 8          # aus dem SDP der Agent-Leg-Antwort
         self._last_agent_send = 0.0
-        self._silence = b
+        self._silence = b""
         self._seq = 0
         self._ts = 0
         self._ssrc = 0x5A17C0DE
