@@ -83,7 +83,8 @@ def count_rtp_sockets(pid: int) -> int:
         if len(parts) < 5:
             continue
         try:
-            port = int(parts[4].rsplit(":", 1)[1])
+            # ss -uanp: Feld 3 ist die lokale Adresse, Feld 4 der Peer
+            port = int(parts[3].rsplit(":", 1)[1])
         except (IndexError, ValueError):
             continue
         if 10000 <= port <= 20000:
