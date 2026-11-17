@@ -97,9 +97,12 @@ class TransferController:
         self._last_agent_send = 0.0
         self._last_ai_audio = 0.0
         self._size_counts = 0
+        self._src_gaps = 0
+        self._src_gap_ms = 0.0
+        self._prev_ai_ts = 0.0
         self._briefing_ready = False
         self._silence = b""
-        self._agent_tx = deque(maxlen=150)
+        self._agent_tx = deque(maxlen=750)
         self._seq = 0
         self._ts = 0
         self._ssrc = 0x5A17C0DE
@@ -286,6 +289,15 @@ class TransferController:
         except OSError:
             return
 
+    def _track_source_gap(self) -> None:
+        now = time.monotonic()
+        if self._prev_ai_ts:
+            dt = (now - self._prev_ai_ts) * 1000.0
+            if dt > 60.0:            # Luecke in der Quelle (KI/Audio-Adapter)
+                self._src_gaps += 1
+                self._src_gap_ms += dt
+        self._prev_ai_ts = now
+
     def note_ai_audio(self) -> None:
         """Merkt sich, wann die KI zuletzt Audio geliefert hat."""
         self._last_ai_audio = time.monotonic()
@@ -310,6 +322,7 @@ class TransferController:
             return False
         if self.mode == "briefing" and self._agent_sock and self._agent_addr:
             self._log_sizes(pcm, "ki")
+            self._track_source_gap()
             self._agent_tx.append(pcm)
             self._ai_frames += 1
         return True
@@ -411,9 +424,12 @@ class TransferController:
         task = asyncio.create_task(coro)
         self._tasks.append(task)
 
-    def stats(self) -> dict[str, int | str]:
+    def stats(self) -> dict[str, int | str | float]:
         return {
             "mode": self.mode,
+            "src_gaps": self._src_gaps,
+            "src_gap_ms": round(self._src_gap_ms, 1),
+            "queue": len(self._agent_tx),
             "caller_frames": self._caller_frames,
             "ai_frames": self._ai_frames,
             "agent_frames": self._agent_frames,
