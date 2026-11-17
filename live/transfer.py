@@ -135,8 +135,11 @@ class TransferController:
             return {"ok": True, "status": "laeuft_bereits", "mode": self.mode}
 
         self._load_moh()
-        self.mode = "moh"
-        self._start_task(self._moh_task())
+        # Der Satz an den Anrufer ("Einen Moment, ich stelle durch") darf nicht
+        # mitten im Wort abgeschnitten werden: Audio geht weiter an den Anrufer,
+        # MOH startet erst nach der Grace-Zeit.
+        grace = float(os.getenv("TRANSFER_GRACE", "2.0"))
+        grace_until = time.monotonic() + grace
 
         try:
             self._trunk = TrunkClient(self._trunk_config())
@@ -166,6 +169,13 @@ class TransferController:
             self._agent_addr = parse_sdp_media(dialog.get("sdp", ""))
             self._agent_pt = parse_sdp_payload_type(dialog.get("sdp", ""))
             logger.info("Transfer-Bein steht", target=target, agent_rtp=self._agent_addr)
+
+            rest = grace_until - time.monotonic()
+            if rest > 0:
+                await asyncio.sleep(rest)
+
+            self.mode = "moh"
+            self._start_task(self._moh_task())
 
             # Restpuffer der KI verwerfen: der Satz an den Anrufer darf nicht
             # beim Mitarbeiter landen
