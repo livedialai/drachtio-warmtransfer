@@ -94,8 +94,9 @@ class TransferController:
         self._agent_pt = 8          # aus dem SDP der Agent-Leg-Antwort
         self._last_agent_send = 0.0
         self._last_ai_audio = 0.0
+        self._size_counts = 0
         self._silence = b""
-        self._agent_tx = deque(maxlen=25)
+        self._agent_tx = deque(maxlen=150)
         self._seq = 0
         self._ts = 0
         self._ssrc = 0x5A17C0DE
@@ -264,11 +265,17 @@ class TransferController:
             self._agent_tx.append(pcm)
             self._caller_frames += 1
 
+    def _log_sizes(self, pcm: bytes, quelle: str) -> None:
+        self._size_counts += 1
+        if self._size_counts <= 12:
+            logger.info("audio frame", quelle=quelle, bytes=len(pcm), mode=self.mode)
+
     def on_ai_pcm(self, pcm: bytes) -> bool:
         """KI-Audio (Downlink). True = selbst verarbeitet, nicht an den Anrufer."""
         if self.mode == "ai":
             return False
         if self.mode == "briefing" and self._agent_sock and self._agent_addr:
+            self._log_sizes(pcm, "ki")
             self._agent_tx.append(pcm)
             self._ai_frames += 1
         return True
@@ -277,21 +284,27 @@ class TransferController:
         return self.mode in ("moh", "briefing")
 
     async def _moh_task(self) -> None:
-        """Schickt Wartemusik an den Anrufer, solange er geparkt ist."""
+        """Schickt Wartemusik an den Anrufer, solange er geparkt ist.
+
+        Die RTP-Session taktet selbst mit 20 ms; deshalb werden 200-ms-Bloecke
+        eingespeist, damit Jitter nicht als Luecke hoerbar wird.
+        """
         loop = asyncio.get_running_loop()
+        block = 10
         while True:
             if not self.should_send_moh() or not self._moh_frames:
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.05)
                 continue
             if self._moh_idx and self._moh_idx % 150 == 0:
                 logger.info("transfer stats", **self.stats(), agent_rtp=self._agent_addr, pt=self._agent_pt)
-            frame = self._moh_frames[self._moh_idx % len(self._moh_frames)]
-            self._moh_idx += 1
-            try:
-                await self.rtp.send_audio(frame)
-            except Exception:  # noqa: BLE001
-                pass
-            await asyncio.sleep(0.02)
+            for _ in range(block):
+                frame = self._moh_frames[self._moh_idx % len(self._moh_frames)]
+                self._moh_idx += 1
+                try:
+                    await self.rtp.send_audio(frame)
+                except Exception:  # noqa: BLE001
+                    pass
+            await asyncio.sleep(0.2)
             _ = loop  # keep reference for clarity
 
     async def _agent_keepalive_task(self) -> None:
