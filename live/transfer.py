@@ -127,7 +127,9 @@ class TransferController:
             user=os.getenv("TRUNK_USER", ""),
             password=os.getenv("TRUNK_PASS", ""),
             caller_id=os.getenv("TRUNK_CLI", ""),
-            local_port=int(os.getenv("TRUNK_LOCAL_PORT", "5070")),
+            # ephemerer Port: feste Ports kollidieren, wenn ein Transfer noch
+            # nicht abgeraeumt ist ([Errno 98] Address already in use)
+            local_port=int(os.getenv("TRANSFER_LOCAL_PORT", "0")),
         )
 
     # --------------------------------------------------------------- Steuerung
